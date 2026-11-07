@@ -2,7 +2,33 @@ process.env.TZ = process.env.TZ || 'Asia/Makassar';
 const os = require('os'), http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
 const PORT = process.env.PORT || 3000, PASS = process.env.ADMIN_PASSWORD || 'admin123', SHOP = process.env.SHOP_NAME || 'Toko Aksesoris';
-const db = new DatabaseSync(path.join(__dirname, 'toko.db'));
+// ---------- DATABASE ----------
+// Lokasi DB bisa diatur lewat DB_PATH (mis. ke folder volume/persistent storage di hosting).
+// Kalau DB_PATH belum ada filenya, toko.db bawaan disalin dulu ke sana.
+const BUNDLED = path.join(__dirname, 'toko.db');
+let DB_FILE = process.env.DB_PATH || BUNDLED, DB_TEMP = false;
+const openDb = f => {
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  if (f !== BUNDLED && !fs.existsSync(f) && fs.existsSync(BUNDLED)) { fs.copyFileSync(BUNDLED, f); try { fs.chmodSync(f, 0o644); } catch {} }
+  const d = new DatabaseSync(f), tes = () => { d.exec('CREATE TABLE IF NOT EXISTS _tulis_tes(x)'); d.exec('DROP TABLE _tulis_tes'); }; // pastikan benar-benar bisa menulis
+  try { tes(); }
+  catch (e) {
+    // Folder read-only (SQLite tidak bisa bikin file journal) tapi file DB masih bisa ditulis -> pakai journal di memori.
+    d.exec('PRAGMA journal_mode=MEMORY'); tes();
+    console.warn('⚠ Folder database read-only, memakai journal_mode=MEMORY (tetap bisa menyimpan).');
+  }
+  return d;
+};
+let db;
+try { db = openDb(DB_FILE); }
+catch (e) {
+  console.error(`\n⚠ Database di "${DB_FILE}" TIDAK BISA DITULIS: ${e.message}`);
+  DB_FILE = path.join(os.tmpdir(), 'toko.db'); DB_TEMP = true;
+  console.error(`⚠ Memakai database sementara di "${DB_FILE}". Pesanan tetap bisa masuk, tapi DATA HILANG saat server restart/redeploy.`);
+  console.error('⚠ Solusi: aktifkan persistent storage/volume di hosting, lalu set DB_PATH ke folder volume itu (mis. /data/toko.db).\n');
+  if (fs.existsSync(BUNDLED) && !fs.existsSync(DB_FILE)) { fs.copyFileSync(BUNDLED, DB_FILE); try { fs.chmodSync(DB_FILE, 0o644); } catch {} }
+  db = openDb(DB_FILE);
+}
 db.exec(`
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
 CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, name TEXT, price INTEGER, description TEXT DEFAULT '', available INTEGER DEFAULT 1, ver INTEGER DEFAULT 0);
@@ -17,6 +43,12 @@ if (!get('SELECT id FROM categories')) for (const c of ['Gelang', 'Kalung', 'Cin
 const setting = k => get('SELECT value FROM settings WHERE key=?', k)?.value;
 const setS = (k, v) => run('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', k, v);
 const bump = () => setS('v', String(Date.now()));
+// ---------- DIAGNOSA: satu baris ringkas di log saat server start ----------
+try {
+  const st = fs.statSync(DB_FILE), ok = (p) => { try { fs.accessSync(p, fs.constants.W_OK); return true; } catch { return false; } };
+  let tulis = 'OK'; try { setS('_diag', String(Date.now())); run("DELETE FROM settings WHERE key='_diag'"); } catch (e) { tulis = 'GAGAL: ' + e.message; }
+  console.log(`[DIAG] node ${process.version} | uid ${process.getuid?.()} | DB ${DB_FILE} (${(st.size / 1048576).toFixed(1)} MB, mode ${(st.mode & 0o777).toString(8)}, owner ${st.uid}) | file bisa ditulis: ${ok(DB_FILE)} | folder bisa ditulis: ${ok(path.dirname(DB_FILE))} | tes tulis DB: ${tulis}`);
+} catch (e) { console.log('[DIAG] gagal:', e.message); }
 const IMG = /^data:image\/(png|jpe?g|webp);base64,/, IMGK = ['logo', 'banner', 'qris'];
 const dayKey = ts => { const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 const FUL = { antar: 'Antar', ambil: 'Ambil', cod: 'COD' };
@@ -164,5 +196,10 @@ http.createServer(async (req, res) => {
       return out?.raw ? send(200, out.raw, out.type, hd) : send(200, JSON.stringify(out), 'application/json', hd);
     }
     throw err(404, 'API tidak ada');
-  } catch (e) { res.writeHead(e.status || 500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: e.status ? e.message : 'Server error', ...e.extra })); if (!e.status) console.error(e); }
-}).listen(PORT, () => console.log(`\n♡ Toko berjalan\n   Pelanggan: http://localhost:${PORT}\n   Admin    : http://localhost:${PORT}/admin  (password: ${PASS})\n   Alamat HP (satu WiFi): http://${lanIP() || 'IP-laptop'}:${PORT}\n`));
+  } catch (e) {
+    const dbErr = !e.status && /readonly|read-only|unable to open|disk I\/O|database is locked/i.test(String(e.message));
+    res.writeHead(e.status || 500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: e.status ? e.message : dbErr ? 'Database toko tidak bisa menyimpan data. Hubungi admin toko.' : 'Server error' + (process.env.DEBUG ? ': ' + e.message : ''), ...e.extra }));
+    if (!e.status) console.error(`[ERROR] ${req.method} ${req.url} ->`, e);
+  }
+}).listen(PORT, () => console.log(`\n♡ Toko berjalan\n   Pelanggan: http://localhost:${PORT}\n   Admin    : http://localhost:${PORT}/admin  (password: ${PASS})\n   Alamat HP (satu WiFi): http://${lanIP() || 'IP-laptop'}:${PORT}\n   Database : ${DB_FILE}${DB_TEMP ? '  (SEMENTARA - data bisa hilang!)' : ''}\n`));
